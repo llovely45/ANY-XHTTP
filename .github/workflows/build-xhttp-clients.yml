@@ -67,6 +67,7 @@ jobs:
         working-directory: clients/v2rayNG/AndroidLibXrayLite
         shell: bash
         run: |
+          mkdir -p data
           bash gen_assets.sh download
           cp -v data/*.dat assets/
           go mod edit -replace="github.com/xtls/xray-core=$GITHUB_WORKSPACE"
@@ -270,3 +271,31 @@ jobs:
           path: v2rayN-${{ matrix.platform }}-${{ matrix.arch }}-xhttp-multipath.*
           if-no-files-found: error
           retention-days: 30
+
+  publish-release:
+    name: Publish downloadable release
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - v2rayng-android
+      - v2rayn-desktop
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all client packages
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+
+      - name: Publish prerelease with client packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="xhttp-multipath-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" release-assets/*/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "XHTTP multipath build ${GITHUB_RUN_NUMBER}" \
+            --notes "Built from commit ${GITHUB_SHA}. This is an experimental build." \
+            --prerelease \
+            --target "$GITHUB_SHA"
