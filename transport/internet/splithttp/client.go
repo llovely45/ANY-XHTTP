@@ -67,6 +67,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		return nil, nil, nil, err
 	}
 	c.transportConfig.FillStreamRequest(req, sessionId, "")
+	applyMultiPathHeaders(req.Header, ctx)
 
 	wrc = &WaitReadCloser{wait: done.New()}
 	go func() {
@@ -105,6 +106,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 		return err
 	}
 	c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
+	applyMultiPathHeaders(req.Header, ctx)
 
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)

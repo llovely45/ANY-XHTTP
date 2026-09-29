@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"maps"
 	"math/big"
+	stdnet "net"
 	"net/url"
 	"sort"
 	"strconv"
@@ -259,36 +260,46 @@ func (c *TCPConfig) Build() (proto.Message, error) {
 }
 
 type SplitHTTPConfig struct {
-	Host                 string            `json:"host"`
-	Path                 string            `json:"path"`
-	Mode                 string            `json:"mode"`
-	Headers              map[string]string `json:"headers"`
-	XPaddingBytes        Int32Range        `json:"xPaddingBytes"`
-	XPaddingObfsMode     bool              `json:"xPaddingObfsMode"`
-	XPaddingKey          string            `json:"xPaddingKey"`
-	XPaddingHeader       string            `json:"xPaddingHeader"`
-	XPaddingPlacement    string            `json:"xPaddingPlacement"`
-	XPaddingMethod       string            `json:"xPaddingMethod"`
-	UplinkHTTPMethod     string            `json:"uplinkHTTPMethod"`
-	SessionIDPlacement   string            `json:"sessionIDPlacement"`
-	SessionIDKey         string            `json:"sessionIDKey"`
-	SessionIDTable       string            `json:"sessionIDTable"`
-	SessionIDLength      Int32Range        `json:"sessionIDLength"`
-	SeqPlacement         string            `json:"seqPlacement"`
-	SeqKey               string            `json:"seqKey"`
-	UplinkDataPlacement  string            `json:"uplinkDataPlacement"`
-	UplinkDataKey        string            `json:"uplinkDataKey"`
-	UplinkChunkSize      Int32Range        `json:"uplinkChunkSize"`
-	NoGRPCHeader         bool              `json:"noGRPCHeader"`
-	NoSSEHeader          bool              `json:"noSSEHeader"`
-	ScMaxEachPostBytes   Int32Range        `json:"scMaxEachPostBytes"`
-	ScMinPostsIntervalMs Int32Range        `json:"scMinPostsIntervalMs"`
-	ScMaxBufferedPosts   int64             `json:"scMaxBufferedPosts"`
-	ScStreamUpServerSecs Int32Range        `json:"scStreamUpServerSecs"`
-	ServerMaxHeaderBytes int32             `json:"serverMaxHeaderBytes"`
-	Xmux                 XmuxConfig        `json:"xmux"`
-	DownloadSettings     *StreamConfig     `json:"downloadSettings"`
-	Extra                json.RawMessage   `json:"extra"`
+	Host                 string             `json:"host"`
+	Path                 string             `json:"path"`
+	Mode                 string             `json:"mode"`
+	Headers              map[string]string  `json:"headers"`
+	XPaddingBytes        Int32Range         `json:"xPaddingBytes"`
+	XPaddingObfsMode     bool               `json:"xPaddingObfsMode"`
+	XPaddingKey          string             `json:"xPaddingKey"`
+	XPaddingHeader       string             `json:"xPaddingHeader"`
+	XPaddingPlacement    string             `json:"xPaddingPlacement"`
+	XPaddingMethod       string             `json:"xPaddingMethod"`
+	UplinkHTTPMethod     string             `json:"uplinkHTTPMethod"`
+	SessionIDPlacement   string             `json:"sessionIDPlacement"`
+	SessionIDKey         string             `json:"sessionIDKey"`
+	SessionIDTable       string             `json:"sessionIDTable"`
+	SessionIDLength      Int32Range         `json:"sessionIDLength"`
+	SeqPlacement         string             `json:"seqPlacement"`
+	SeqKey               string             `json:"seqKey"`
+	UplinkDataPlacement  string             `json:"uplinkDataPlacement"`
+	UplinkDataKey        string             `json:"uplinkDataKey"`
+	UplinkChunkSize      Int32Range         `json:"uplinkChunkSize"`
+	NoGRPCHeader         bool               `json:"noGRPCHeader"`
+	NoSSEHeader          bool               `json:"noSSEHeader"`
+	ScMaxEachPostBytes   Int32Range         `json:"scMaxEachPostBytes"`
+	ScMinPostsIntervalMs Int32Range         `json:"scMinPostsIntervalMs"`
+	ScMaxBufferedPosts   int64              `json:"scMaxBufferedPosts"`
+	ScStreamUpServerSecs Int32Range         `json:"scStreamUpServerSecs"`
+	ServerMaxHeaderBytes int32              `json:"serverMaxHeaderBytes"`
+	Xmux                 XmuxConfig         `json:"xmux"`
+	MultiPath            *MultiPathSettings `json:"multipath"`
+	DownloadSettings     *StreamConfig      `json:"downloadSettings"`
+	Extra                json.RawMessage    `json:"extra"`
+}
+
+type MultiPathSettings struct {
+	Enabled                 bool     `json:"enabled"`
+	Addresses               []string `json:"addresses"`
+	ChunkSize               uint32   `json:"chunkSize"`
+	MaxBufferSize           uint32   `json:"maxBufferSize"`
+	MaxPaths                uint32   `json:"maxPaths"`
+	HandshakeTimeoutSeconds uint32   `json:"handshakeTimeoutSeconds"`
 }
 
 type XmuxConfig struct {
@@ -450,6 +461,70 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
 		return nil, errors.New("invalid negative value of maxHeaderBytes")
 	}
 
+	var multiPathConfig *splithttp.MultiPathConfig
+	if c.MultiPath != nil {
+		mp := c.MultiPath
+		if !mp.Enabled && len(mp.Addresses) > 0 {
+			return nil, errors.New(`"multipath.addresses" requires "multipath.enabled": true`)
+		}
+		if mp.Enabled {
+			maxPaths := mp.MaxPaths
+			if maxPaths == 0 {
+				maxPaths = 8
+			}
+			if maxPaths < 2 || maxPaths > 16 {
+				return nil, errors.New(`"multipath.maxPaths" must be between 2 and 16`)
+			}
+			if len(mp.Addresses) == 1 || len(mp.Addresses) > int(maxPaths) {
+				return nil, errors.New(`"multipath.addresses" must contain 0 or between 2 and maxPaths addresses`)
+			}
+			seenAddresses := make(map[string]struct{}, len(mp.Addresses))
+			for _, address := range mp.Addresses {
+				ip := stdnet.ParseIP(address)
+				if ip == nil {
+					return nil, errors.New(`"multipath.addresses" must contain IP addresses, got "`, address, `"`)
+				}
+				canonicalAddress := ip.String()
+				if _, exists := seenAddresses[canonicalAddress]; exists {
+					return nil, errors.New(`duplicate IP address in "multipath.addresses": "`, address, `"`)
+				}
+				seenAddresses[canonicalAddress] = struct{}{}
+			}
+			if c.DownloadSettings != nil {
+				return nil, errors.New(`"multipath" cannot be combined with "downloadSettings" yet`)
+			}
+			chunkSize := mp.ChunkSize
+			if chunkSize == 0 {
+				chunkSize = 16 * 1024
+			}
+			if chunkSize < 1024 || chunkSize > 1024*1024 {
+				return nil, errors.New(`"multipath.chunkSize" must be between 1024 and 1048576 bytes`)
+			}
+			maxBufferSize := mp.MaxBufferSize
+			if maxBufferSize == 0 {
+				maxBufferSize = 4 * 1024 * 1024
+			}
+			if maxBufferSize < chunkSize*2 || maxBufferSize > 64*1024*1024 {
+				return nil, errors.New(`"multipath.maxBufferSize" must be at least twice chunkSize and no more than 67108864 bytes`)
+			}
+			handshakeTimeout := mp.HandshakeTimeoutSeconds
+			if handshakeTimeout == 0 {
+				handshakeTimeout = 15
+			}
+			if handshakeTimeout > 120 {
+				return nil, errors.New(`"multipath.handshakeTimeoutSeconds" must be no more than 120`)
+			}
+			multiPathConfig = &splithttp.MultiPathConfig{
+				Enabled:                 true,
+				Addresses:               append([]string(nil), mp.Addresses...),
+				ChunkSize:               chunkSize,
+				MaxBufferSize:           maxBufferSize,
+				MaxPaths:                maxPaths,
+				HandshakeTimeoutSeconds: handshakeTimeout,
+			}
+		}
+	}
+
 	if c.Xmux.MaxConnections.To > 0 && c.Xmux.MaxConcurrency.To > 0 {
 		return nil, errors.New("maxConnections cannot be specified together with maxConcurrency")
 	}
@@ -490,6 +565,7 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
 		ServerMaxHeaderBytes: c.ServerMaxHeaderBytes,
 		SessionIDTable:       c.SessionIDTable,
 		SessionIDLength:      newRangeConfig(c.SessionIDLength),
+		Multipath:            multiPathConfig,
 		Xmux: &splithttp.XmuxConfig{
 			MaxConcurrency:   newRangeConfig(c.Xmux.MaxConcurrency),
 			MaxConnections:   newRangeConfig(c.Xmux.MaxConnections),

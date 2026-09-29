@@ -1,0 +1,271 @@
+name: Build XHTTP multipath clients
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/xhttp-multipath
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xhttp-client-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  v2rayng-android:
+    name: v2rayNG Android APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Xray multipath source
+        uses: actions/checkout@v7
+
+      - name: Checkout v2rayNG
+        uses: actions/checkout@v7
+        with:
+          repository: 2dust/v2rayNG
+          ref: bd21bbc3f9ccad349e48bad580e4125ff36a1969
+          path: clients/v2rayNG
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+          cmdline-tools-version: "14742923"
+          packages: "platforms;android-37.0 build-tools;37.0.0 platform-tools"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --channel=0 --install "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Build v2rayNG native tunnel library
+        working-directory: clients/v2rayNG
+        shell: bash
+        run: |
+          bash compile-hevtun.sh
+          mkdir -p V2rayNG/app/libs
+          cp -R libs V2rayNG/app/
+
+      - name: Build libv2ray with this Xray source
+        working-directory: clients/v2rayNG/AndroidLibXrayLite
+        shell: bash
+        run: |
+          bash gen_assets.sh download
+          cp -v data/*.dat assets/
+          go mod edit -replace="github.com/xtls/xray-core=$GITHUB_WORKSPACE"
+          MOBILE_VERSION="$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
+          go install "golang.org/x/mobile/cmd/gomobile@$MOBILE_VERSION"
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+          go mod tidy -v
+          gomobile bind -v -target android -androidapi 24 -trimpath \
+            -ldflags='-s -w -buildid= -checklinkname=0' -o libv2ray.aar ./
+          cp libv2ray.aar ../V2rayNG/app/libs/libv2ray.aar
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Build v2rayNG APK
+        working-directory: clients/v2rayNG/V2rayNG
+        shell: bash
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod 755 gradlew
+          ./gradlew --no-daemon assembleFdroidDebug
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp app/build/outputs/apk/fdroid/debug/*universal*.apk \
+            "$GITHUB_WORKSPACE/dist/v2rayNG-fdroid-xhttp-multipath.apk"
+
+      - name: Upload v2rayNG APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: v2rayNG-Android
+          path: dist/v2rayNG-fdroid-xhttp-multipath.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  v2rayn-desktop:
+    name: v2rayN ${{ matrix.platform }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: windows
+            arch: 64
+            goos: windows
+            goarch: amd64
+            extension: .exe
+            rid: win-x64
+            project: ./v2rayN/v2rayN.csproj
+            core_zip: v2rayN-windows-64.zip
+            core_folder: v2rayN-windows-64
+          - runner: windows-latest
+            platform: windows
+            arch: arm64
+            goos: windows
+            goarch: arm64
+            extension: .exe
+            rid: win-arm64
+            project: ./v2rayN/v2rayN.csproj
+            core_zip: v2rayN-windows-arm64.zip
+            core_folder: v2rayN-windows-arm64
+          - runner: macos-latest
+            platform: macos
+            arch: 64
+            goos: darwin
+            goarch: amd64
+            extension: ""
+            rid: osx-x64
+            project: ./v2rayN.Desktop/v2rayN.Desktop.csproj
+            core_zip: v2rayN-macos-64.zip
+            core_folder: v2rayN-macos-64
+          - runner: macos-latest
+            platform: macos
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+            extension: ""
+            rid: osx-arm64
+            project: ./v2rayN.Desktop/v2rayN.Desktop.csproj
+            core_zip: v2rayN-macos-arm64.zip
+            core_folder: v2rayN-macos-arm64
+    steps:
+      - name: Checkout Xray multipath source
+        uses: actions/checkout@v7
+
+      - name: Checkout v2rayN
+        uses: actions/checkout@v7
+        with:
+          repository: 2dust/v2rayN
+          ref: e0c790eeb224f393945f880957ed975a1277cde6
+          path: clients/v2rayN
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.1xx
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Build Xray core for v2rayN
+        shell: pwsh
+        run: |
+          $env:GOOS = "${{ matrix.goos }}"
+          $env:GOARCH = "${{ matrix.goarch }}"
+          $env:CGO_ENABLED = "0"
+          $xrayPath = Join-Path $env:RUNNER_TEMP "xray${{ matrix.extension }}"
+          $buildId = "${{ github.sha }}".Substring(0, 12)
+          $ldflags = "-X github.com/xtls/xray-core/core.build=$buildId -s -w -buildid="
+          go build -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="$ldflags" -o $xrayPath ./main
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish v2rayN
+        working-directory: clients/v2rayN/v2rayN
+        shell: pwsh
+        run: |
+          $publishPath = Join-Path $env:RUNNER_TEMP "v2rayn-publish"
+          dotnet publish "${{ matrix.project }}" -c Release -r "${{ matrix.rid }}" `
+            -p:SelfContained=true -o $publishPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package v2rayN with the custom Xray core
+        shell: pwsh
+        run: |
+          $coreArchive = Join-Path $env:RUNNER_TEMP "${{ matrix.core_zip }}"
+          $coreBaseUrl = "https://github.com/2dust/v2rayN-core-bin/raw/5dab9a302a08001779a397e9e61ec78a9b56f884/${{ matrix.core_zip }}"
+          Invoke-WebRequest -Uri $coreBaseUrl -OutFile $coreArchive
+          $extractRoot = Join-Path $env:RUNNER_TEMP "v2rayn-core"
+          Expand-Archive -LiteralPath $coreArchive -DestinationPath $extractRoot -Force
+          $packageRoot = Join-Path $extractRoot "${{ matrix.core_folder }}"
+          if (!(Test-Path $packageRoot)) { throw "Missing core package directory: $packageRoot" }
+
+          $xrayName = "xray${{ matrix.extension }}"
+          $targetXray = Join-Path $packageRoot "bin/xray/$xrayName"
+          if (!(Test-Path (Split-Path $targetXray))) { throw "Missing Xray directory: $(Split-Path $targetXray)" }
+          Copy-Item (Join-Path $env:RUNNER_TEMP $xrayName) $targetXray -Force
+
+          $publishPath = Join-Path $env:RUNNER_TEMP "v2rayn-publish"
+          Copy-Item (Join-Path $publishPath "*") $packageRoot -Recurse -Force
+
+          if ("${{ matrix.platform }}" -eq "windows") {
+            $zipPath = Join-Path $env:GITHUB_WORKSPACE "v2rayN-windows-${{ matrix.arch }}-xhttp-multipath.zip"
+            python .github/scripts/zip_directory.py $packageRoot $zipPath
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            & chmod +x $targetXray
+            $appPath = Join-Path $env:RUNNER_TEMP "v2rayN.app"
+            $macOSPath = Join-Path $appPath "Contents/MacOS"
+            $resourcesPath = Join-Path $appPath "Contents/Resources"
+            New-Item -ItemType Directory -Force -Path $macOSPath, $resourcesPath | Out-Null
+            Copy-Item (Join-Path $packageRoot "*") $macOSPath -Recurse -Force
+            New-Item -ItemType File -Force -Path (Join-Path $macOSPath "NotStoreConfigHere.txt") | Out-Null
+            $appExecutable = Join-Path $macOSPath "v2rayN"
+            if (!(Test-Path $appExecutable)) { throw "Missing v2rayN app executable: $appExecutable" }
+            & chmod +x $appExecutable
+            $iconPath = Join-Path $macOSPath "v2rayN.icns"
+            if (Test-Path $iconPath) { Copy-Item $iconPath (Join-Path $resourcesPath "AppIcon.icns") -Force }
+
+            $plist = @'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>v2rayN</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleIdentifier</key><string>2dust.v2rayN</string>
+            <key>CFBundleName</key><string>v2rayN</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>1.0.0</string>
+            <key>LSMinimumSystemVersion</key><string>13.6</string>
+          </dict></plist>
+          '@
+            Set-Content -LiteralPath (Join-Path $appPath "Contents/Info.plist") -Value $plist -Encoding utf8NoBOM
+
+            $zipPath = Join-Path $env:GITHUB_WORKSPACE "v2rayN-macos-${{ matrix.arch }}-xhttp-multipath.zip"
+            python .github/scripts/zip_directory.py $appPath $zipPath
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            brew install create-dmg
+            $dmgPath = Join-Path $env:GITHUB_WORKSPACE "v2rayN-macos-${{ matrix.arch }}-xhttp-multipath.dmg"
+            & create-dmg --volname "v2rayN XHTTP multipath" --window-size 700 420 `
+              --icon-size 100 --icon "v2rayN.app" 160 185 --hide-extension "v2rayN.app" `
+              --app-drop-link 500 185 $dmgPath $appPath
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Upload v2rayN package
+        uses: actions/upload-artifact@v7
+        with:
+          name: v2rayN-${{ matrix.platform }}-${{ matrix.arch }}-xhttp-multipath
+          path: v2rayN-${{ matrix.platform }}-${{ matrix.arch }}-xhttp-multipath.*
+          if-no-files-found: error
+          retention-days: 30

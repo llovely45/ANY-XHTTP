@@ -22,6 +22,15 @@ message XmuxConfig {
   int64 hKeepAlivePeriod = 6;
 }
 
+message MultiPathConfig {
+  bool enabled = 1;
+  repeated string addresses = 2;
+  uint32 chunk_size = 3;
+  uint32 max_buffer_size = 4;
+  uint32 max_paths = 5;
+  uint32 handshake_timeout_seconds = 6;
+}
+
 message Config {
   string host = 1;
   string path = 2;
@@ -52,4 +61,5 @@ message Config {
   int32 serverMaxHeaderBytes = 27;
   string sessionIDTable = 28;
   RangeConfig sessionIDLength = 29;
+  MultiPathConfig multipath = 30;
 }

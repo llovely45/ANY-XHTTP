@@ -34,14 +34,15 @@ import (
 )
 
 type requestHandler struct {
-	config         *Config
-	host           string
-	path           string
-	ln             *Listener
-	sessionMu      *sync.Mutex
-	sessions       sync.Map
-	localAddr      net.Addr
-	socketSettings *internet.SocketConfig
+	config          *Config
+	host            string
+	path            string
+	ln              *Listener
+	sessionMu       *sync.Mutex
+	sessions        sync.Map
+	multiPathGroups sync.Map
+	localAddr       net.Addr
+	socketSettings  *internet.SocketConfig
 }
 
 type httpSession struct {
@@ -150,6 +151,20 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	obfsPaddingAccepted := h.config.XPaddingObfsMode && paddingValue != ""
 
 	sessionId, seqStr := h.config.ExtractMetaFromRequest(request, h.path)
+	multiPath, multiPathErr := parseMultiPathHeaders(request.Header.Get)
+	if multiPathErr != nil {
+		errors.LogInfoInner(context.Background(), multiPathErr, "invalid XHTTP multipath metadata")
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if multiPath != nil && !multipathEnabled(h.config.Multipath) {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if multiPath != nil && multiPath.count > normalizedMultiPathMaxPaths(h.config.Multipath) {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
 	if sessionId == "" && h.config.Mode != "" && h.config.Mode != "auto" && h.config.Mode != "stream-one" && h.config.Mode != "stream-up" {
 		errors.LogInfo(context.Background(), "stream-one mode is not allowed")
@@ -388,7 +403,17 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			conn.reader = currentSession.uploadQueue
 		}
 
-		h.ln.addConn(stat.Connection(&conn))
+		var group *multiPathGroup
+		var multiPathLane *multiPathGroupLane
+		if multiPath != nil {
+			multiPathLane = h.addMultiPathLane(*multiPath, stat.Connection(&conn))
+			if multiPathLane != nil {
+				multiPathGroupAny, _ := h.multiPathGroups.Load(multiPath.groupID)
+				group, _ = multiPathGroupAny.(*multiPathGroup)
+			}
+		} else {
+			h.ln.addConn(stat.Connection(&conn))
+		}
 
 		// "A ResponseWriter may not be used after [Handler.ServeHTTP] has returned."
 		select {
@@ -397,6 +422,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		}
 
 		conn.Close()
+		if multiPath != nil {
+			h.removeMultiPathLane(group, multiPath.lane, multiPathLane)
+		}
 	} else {
 		errors.LogInfo(context.Background(), "unsupported method: ", request.Method)
 		writer.WriteHeader(http.StatusMethodNotAllowed)

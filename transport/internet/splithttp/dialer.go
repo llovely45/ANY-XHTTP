@@ -5,6 +5,7 @@ import (
 	gotls "crypto/tls"
 	"fmt"
 	"io"
+	stdnet "net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -38,6 +39,7 @@ import (
 type dialerConf struct {
 	net.Destination
 	*internet.MemoryStreamConfig
+	serverName string
 }
 
 var (
@@ -46,6 +48,7 @@ var (
 )
 
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
+	serverNameDest := logicalDestination(ctx, dest)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
 	if browser_dialer.HasBrowserDialer() && realityConfig == nil {
@@ -59,7 +62,7 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 		globalDialerMap = make(map[dialerConf]*XmuxManager)
 	}
 
-	key := dialerConf{dest, streamSettings}
+	key := dialerConf{Destination: dest, MemoryStreamConfig: streamSettings, serverName: serverNameDest.Address.String()}
 
 	xmuxManager, found := globalDialerMap[key]
 
@@ -71,7 +74,7 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 		}
 
 		xmuxManager = NewXmuxManager(xmuxConfig, func() XmuxConn {
-			return createHTTPClient(dest, streamSettings)
+			return createHTTPClient(dest, serverNameDest, streamSettings)
 		})
 		globalDialerMap[key] = xmuxManager
 	}
@@ -99,9 +102,12 @@ func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) str
 	return "2"
 }
 
-func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
+func createHTTPClient(dest, serverNameDest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+	if realityConfig != nil && realityConfig.ServerName == "" {
+		realityConfig.ServerName = serverNameDest.Address.String()
+	}
 
 	httpVersion := decideHTTPVersion(tlsConfig, realityConfig)
 	if httpVersion == "3" {
@@ -111,7 +117,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 	var gotlsConfig *gotls.Config
 
 	if tlsConfig != nil {
-		gotlsConfig = tlsConfig.GetTLSConfig(tls.WithDestination(dest))
+		gotlsConfig = tlsConfig.GetTLSConfig(tls.WithDestination(serverNameDest))
 	}
 
 	transportConfig := streamSettings.ProtocolSettings.(*Config)
@@ -129,7 +135,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		}
 
 		if realityConfig != nil {
-			return reality.UClient(conn, realityConfig, ctxInner, dest)
+			return reality.UClient(conn, realityConfig, ctxInner, serverNameDest)
 		}
 
 		if gotlsConfig != nil {
@@ -292,6 +298,139 @@ func init() {
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+	transportConfiguration := streamSettings.ProtocolSettings.(*Config)
+	multiPathConfig := transportConfiguration.Multipath
+	if multipathEnabled(multiPathConfig) && !hasMultiPathMeta(ctx) && transportConfiguration.DownloadSettings == nil && !browser_dialer.HasBrowserDialer() {
+		logicalDest := logicalDestination(ctx, dest)
+		addresses, err := multiPathAddresses(dest, logicalDest, streamSettings, multiPathConfig)
+		if err != nil {
+			errors.LogInfoInner(ctx, err, "failed to resolve XHTTP multipath addresses; using one path")
+		}
+		maxPaths := normalizedMultiPathMaxPaths(multiPathConfig)
+		if len(addresses) > maxPaths {
+			addresses = addresses[:maxPaths]
+		}
+		if len(addresses) >= 2 {
+			groupID, groupErr := newMultiPathGroupID()
+			if groupErr == nil {
+				lanes := make([]stat.Connection, len(addresses))
+				laneErrors := make([]error, len(addresses))
+				var dialWG sync.WaitGroup
+				for laneIndex, address := range addresses {
+					dialWG.Add(1)
+					go func(laneIndex int, address net.Address) {
+						defer dialWG.Done()
+						laneDest := dest
+						laneDest.Address = address
+						laneCtx := withMultiPathMeta(ctx, multiPathMeta{
+							groupID:      groupID,
+							lane:         laneIndex,
+							count:        len(addresses),
+							originalDest: logicalDest,
+						})
+						lanes[laneIndex], laneErrors[laneIndex] = dialSingle(laneCtx, laneDest, streamSettings)
+					}(laneIndex, address)
+				}
+				dialWG.Wait()
+
+				allConnected := true
+				for laneIndex, laneErr := range laneErrors {
+					if laneErr != nil {
+						allConnected = false
+						errors.LogInfoInner(ctx, laneErr, "failed to connect XHTTP multipath lane ", laneIndex)
+					}
+				}
+				if allConnected {
+					if conn, err := newMultiPathConn(lanes, multiPathConfig); err == nil {
+						return conn, nil
+					} else {
+						for _, lane := range lanes {
+							_ = lane.Close()
+						}
+						errors.LogInfoInner(ctx, err, "failed to create XHTTP multipath connection; using one path")
+					}
+				} else {
+					for _, lane := range lanes {
+						if lane != nil {
+							_ = lane.Close()
+						}
+					}
+				}
+			} else {
+				errors.LogInfoInner(ctx, groupErr, "failed to create XHTTP multipath group identifier; using one path")
+			}
+		}
+	} else if multipathEnabled(multiPathConfig) && !hasMultiPathMeta(ctx) && browser_dialer.HasBrowserDialer() {
+		errors.LogInfo(ctx, "XHTTP multipath is unavailable with the browser dialer; using one path")
+	}
+	return dialSingle(ctx, dest, streamSettings)
+}
+
+func hasMultiPathMeta(ctx context.Context) bool {
+	_, ok := multiPathMetaFromContext(ctx)
+	return ok
+}
+
+func logicalDestination(ctx context.Context, dest net.Destination) net.Destination {
+	if meta, ok := multiPathMetaFromContext(ctx); ok && meta.originalDest.Address != nil {
+		return meta.originalDest
+	}
+	// Dial receives the Xray server endpoint. The outbound session's
+	// OriginalTarget is the proxied destination and must not be used here for
+	// DNS, TLS SNI, REALITY SNI, or the default HTTP Host.
+	return dest
+}
+
+func multiPathAddresses(dest, logicalDest net.Destination, streamSettings *internet.MemoryStreamConfig, config *MultiPathConfig) ([]net.Address, error) {
+	addresses := make([]net.Address, 0, len(config.Addresses))
+	if len(config.Addresses) > 0 {
+		seen := make(map[string]struct{}, len(config.Addresses))
+		for _, address := range config.Addresses {
+			ip := stdnet.ParseIP(address)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid multipath address %q", address)
+			}
+			key := ip.String()
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			addresses = append(addresses, net.IPAddress(ip))
+		}
+		return addresses, nil
+	}
+	if logicalDest.Address == nil || !logicalDest.Address.Family().IsDomain() {
+		return nil, nil
+	}
+
+	strategy := internet.DomainStrategy_USE_IP
+	if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.DomainStrategy.HasStrategy() {
+		strategy = streamSettings.SocketSettings.DomainStrategy
+	} else if dest.Address != nil && dest.Address.Family().IsIP() {
+		if dest.Address.Family().IsIPv4() {
+			strategy = internet.DomainStrategy_USE_IP4
+		} else {
+			strategy = internet.DomainStrategy_USE_IP6
+		}
+	}
+	ips, err := internet.LookupForIP(logicalDest.Address.Domain(), strategy, nil)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(ips))
+	for _, ip := range ips {
+		key := ip.String()
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		addresses = append(addresses, net.IPAddress(ip))
+	}
+	return addresses, nil
+}
+
+func dialSingle(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+	logicalDest := logicalDestination(ctx, dest)
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
@@ -308,6 +447,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	} else {
 		requestURL.Scheme = "http"
 	}
+	// The dial address may be a selected CDN IP. Explicit XHTTP Host and TLS/
+	// REALITY server names keep their existing precedence and values.
 	requestURL.Host = transportConfiguration.Host
 	if requestURL.Host == "" && tlsConfig != nil {
 		requestURL.Host = tlsConfig.ServerName
@@ -316,7 +457,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		requestURL.Host = realityConfig.ServerName
 	}
 	if requestURL.Host == "" {
-		requestURL.Host = dest.Address.String()
+		requestURL.Host = logicalDest.Address.String()
 	}
 	if browser_dialer.HasBrowserDialer() && realityConfig == nil {
 		// For Browser Dialer's optimized IP and non-standard port
