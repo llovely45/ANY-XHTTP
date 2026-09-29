@@ -190,6 +190,10 @@ jobs:
           go build -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="$ldflags" -o $xrayPath ./main
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Fix nullable macOS tray tooltip
+        if: matrix.platform == 'macos'
+        run: python .github/scripts/patch_v2rayn_macos.py clients/v2rayN/v2rayN.Desktop/App.axaml
+
       - name: Publish v2rayN
         working-directory: clients/v2rayN/v2rayN
         shell: pwsh
