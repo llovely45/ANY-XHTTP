@@ -192,7 +192,7 @@ jobs:
 
       - name: Fix nullable macOS tray tooltip
         if: matrix.platform == 'macos'
-        run: python .github/scripts/patch_v2rayn_macos.py clients/v2rayN/v2rayN.Desktop/App.axaml
+        run: python .github/scripts/patch_v2rayn_macos.py clients/v2rayN/v2rayN/v2rayN.Desktop/App.axaml
 
       - name: Publish v2rayN
         working-directory: clients/v2rayN/v2rayN
